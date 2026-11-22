@@ -1,0 +1,108 @@
+# =============================================================
+# Robô RZNH — tenta criar a máquina grátis da Oracle (2 OCPU / 12 GB)
+# a cada ~5 minutos, até conseguir. Quando consegue:
+#   1) abre uma "Issue" neste repositório (chega no seu e-mail)
+#   2) se desliga sozinho
+# Secrets necessários: OCI_CONFIG, OCI_KEY, SSH_PUB, LIVEKIT_INIT_B64
+# =============================================================
+name: Robo Oracle RZNH
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  issues: write
+
+concurrency:
+  group: robo-oracle
+  cancel-in-progress: false
+
+jobs:
+  tentar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar a ferramenta da Oracle
+        run: pip install --quiet --disable-pip-version-check oci-cli
+
+      - name: Configurar acesso
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUB: ${{ secrets.SSH_PUB }}
+          LIVEKIT_INIT_B64: ${{ secrets.LIVEKIT_INIT_B64 }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_CONFIG" | tr -d '\r' | grep -v '^key_file' > ~/.oci/config
+          echo "key_file=$HOME/.oci/key.pem" >> ~/.oci/config
+          printf '%s\n' "$OCI_KEY" | tr -d '\r' > ~/.oci/key.pem
+          chmod 600 ~/.oci/config ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUB" | tr -d '\r' > ~/resenha.pub
+          printf '%s' "$LIVEKIT_INIT_B64" | tr -d ' \r\n' | base64 -d > ~/livekit-init.sh
+          grep -q '^\[DEFAULT\]' ~/.oci/config || { echo "::error::OCI_CONFIG sem a linha [DEFAULT]"; exit 1; }
+          grep -q 'PRIVATE KEY' ~/.oci/key.pem || { echo "::error::OCI_KEY nao parece uma chave privada"; exit 1; }
+          grep -q '^ssh-' ~/resenha.pub || { echo "::error::SSH_PUB deve comecar com ssh-rsa"; exit 1; }
+          head -1 ~/livekit-init.sh | grep -q bash || { echo "::error::LIVEKIT_INIT_B64 invalido"; exit 1; }
+          echo "Acesso configurado."
+
+      - name: Tentar criar a maquina
+        run: |
+          C=$(grep '^tenancy' ~/.oci/config | cut -d= -f2 | tr -d ' ')
+
+          # Se a maquina ja existe, nao cria outra: desliga o robo
+          JA=$(oci compute instance list --compartment-id "$C" --display-name resenha-voz --all \
+                --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" --raw-output 2>/dev/null || echo 0)
+          if [ "${JA:-0}" -gt 0 ] 2>/dev/null; then
+            echo "A maquina resenha-voz ja existe. Desligando o robo."
+            gh workflow disable "${{ github.workflow }}" -R "${{ github.repository }}"
+            exit 0
+          fi
+
+          AD=$(oci iam availability-domain list --compartment-id "$C" --query 'data[0].name' --raw-output)
+          SUBNET=$(oci network subnet list --compartment-id "$C" --display-name subnet-20261121-1918 --query 'data[0].id' --raw-output)
+          IMAGE=$(oci compute image list --compartment-id "$C" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+                  --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --all \
+                  | jq -r '[.data[] | select(."display-name" | contains("Minimal") | not)][0].id')
+          if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ] || [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
+            echo "::error::Nao encontrei a sub-rede ou a imagem do Ubuntu."; exit 1
+          fi
+
+          OUT=$(oci compute instance launch --compartment-id "$C" --availability-domain "$AD" \
+                --display-name resenha-voz --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --ssh-authorized-keys-file ~/resenha.pub --user-data-file ~/livekit-init.sh 2>&1) || true
+
+          if echo "$OUT" | grep -q '"lifecycle-state"'; then
+            ID=$(echo "$OUT" | jq -r '.data.id')
+            echo "CONSEGUIMOS! Aguardando a maquina ligar..."
+            oci compute instance get --instance-id "$ID" --wait-for-state RUNNING --max-wait-seconds 600 >/dev/null 2>&1 || true
+            IP=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
+            {
+              echo "## 🎉 A máquina do RZNH foi criada (2 OCPU / 12 GB)"
+              echo ""
+              echo "- **IP:** \`$IP\`"
+              echo "- **LIVEKIT_URL:** \`ws://$IP:7880\`"
+              echo ""
+              echo "O servidor de voz se instala sozinho em ~5 minutos."
+              echo "A KEY e a SECRET estão no Cloud Shell da Oracle: \`grep -A1 keys: ~/livekit-init.sh\`"
+              echo ""
+              echo "Depois, troque os 3 Secrets no Supabase (Edge Functions → Secrets)."
+            } > aviso.md
+            gh issue create -R "${{ github.repository }}" --title "CONSEGUIMOS! Máquina RZNH criada — IP $IP" --body-file aviso.md
+            gh workflow disable "${{ github.workflow }}" -R "${{ github.repository }}"
+          else
+            MSG=$(echo "$OUT" | grep -o '"message": "[^"]*"' | head -1)
+            echo "Sem vaga desta vez: ${MSG:-resposta inesperada}"
+            echo "$OUT" | grep -q 'NotAuthenticated\|NotAuthorized' && { echo "::error::A Oracle recusou o acesso. Confira OCI_CONFIG e OCI_KEY."; exit 1; }
+            exit 0
+          fi
