@@ -1,7 +1,7 @@
 # =============================================================
 # Robô RZNH — tenta criar a máquina grátis da Oracle (2 OCPU / 12 GB)
-# sem parar: cada execução fica até ~5h45 tentando a cada 1-2 minutos,
-# e o agendamento abre uma nova se a anterior acabou. Quando consegue:
+# sem parar: cada execução fica ~5h40 tentando a cada 1-2 minutos e, no fim,
+# abre a próxima sozinha (o agendamento é só um reforço). Quando consegue:
 #   1) abre uma "Issue" neste repositório (chega no seu e-mail)
 #   2) se desliga sozinho
 # Secrets necessários: OCI_CONFIG, OCI_KEY, SSH_PUB, LIVEKIT_INIT_B64
@@ -10,7 +10,7 @@ name: Robo Oracle RZNH
 
 on:
   schedule:
-    - cron: '17 */2 * * *' # reabre o robô a cada 2 horas (se já tiver um rodando, espera)
+    - cron: '17 */2 * * *' # reforço: se o robô parar por algum motivo, volta em até 2 horas
   workflow_dispatch: {}
 
 permissions:
@@ -114,4 +114,6 @@ jobs:
             # "Too many requests" = a Oracle pediu calma: espera mais
             if echo "$OUT" | grep -qi 'TooManyRequests\|Too many requests'; then sleep 150; else sleep 75; fi
           done
-          echo "Fim desta rodada ($tentativa tentativas). O agendamento abre outra."
+          echo "Fim desta rodada ($tentativa tentativas). Abrindo a próxima sozinho..."
+          # Se renova: pede uma nova execução (ela começa assim que esta terminar)
+          gh workflow run "${{ github.workflow }}" -R "${{ github.repository }}" --ref "${{ github.ref_name }}"
